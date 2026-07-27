@@ -20,6 +20,12 @@ from vllm_omni.diffusion.sched.interface import (
     SamplingParamsKey,
     SchedulerInterface,
 )
+from vllm_omni.diffusion.stage_kv.interface import StageKVCacheMode, StageKVMetadata
+from vllm_omni.diffusion.stage_kv.registry import (
+    StageKVSchedulerRuntime,
+    create_stage_kv_scheduler_runtime,
+    get_stage_kv_cache_mode,
+)
 
 logger = init_logger(__name__)
 
@@ -63,8 +69,14 @@ class _BaseScheduler(SchedulerInterface):
         self._finished_req_ids: set[str] = set()
         self.max_num_running_reqs: int = 1
         self._prefetch_enabled: bool = False
+        self._stage_kv_runtime: StageKVSchedulerRuntime | None = None
+        self._stage_kv_cache_mode = StageKVCacheMode.DENSE_LEGACY
 
     def initialize(self, od_config: OmniDiffusionConfig) -> None:
+        if self._stage_kv_runtime is not None:
+            self._stage_kv_runtime.manager.close()
+            self._stage_kv_runtime = None
+        self._stage_kv_cache_mode = StageKVCacheMode.DENSE_LEGACY
         self.od_config = od_config
         self._request_states.clear()
         self._step_id = 0
@@ -79,6 +91,10 @@ class _BaseScheduler(SchedulerInterface):
             self.max_num_running_reqs = 1
         omni_kv = getattr(od_config, "omni_kv_config", None) or {}
         self._prefetch_enabled = bool(omni_kv.get("enable_kv_async_prefetch", False))
+        stage_kv_cache_mode = get_stage_kv_cache_mode(od_config)
+        stage_kv_runtime = create_stage_kv_scheduler_runtime(od_config)
+        self._stage_kv_cache_mode = stage_kv_cache_mode
+        self._stage_kv_runtime = stage_kv_runtime
         self._reset_scheduler_state()
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
@@ -96,6 +112,7 @@ class _BaseScheduler(SchedulerInterface):
     def schedule(self) -> DiffusionSchedulerOutput:
         scheduled_new_reqs: list[NewRequestData] = []
         scheduled_cached_request_ids: list[str] = []
+        stage_kv_metadata: dict[str, StageKVMetadata] = {}
 
         # First, schedule the RUNNING request(s)
         for request_id in self._running:
@@ -112,6 +129,8 @@ class _BaseScheduler(SchedulerInterface):
                 continue
             if not self._can_schedule_waiting(state):
                 break
+            if not self._ensure_stage_kv_allocation(state):
+                break
 
             self._waiting.popleft()
             was_new_request = state.status == DiffusionRequestStatus.WAITING
@@ -121,6 +140,8 @@ class _BaseScheduler(SchedulerInterface):
             self._running.append(request_id)
             if was_new_request:
                 scheduled_new_reqs.append(NewRequestData.from_state(state))
+                if state.stage_kv_allocation is not None:
+                    stage_kv_metadata[request_id] = state.stage_kv_allocation.to_metadata()
             else:
                 scheduled_cached_request_ids.append(request_id)
 
@@ -148,6 +169,7 @@ class _BaseScheduler(SchedulerInterface):
             num_running_reqs=len(self._running),
             num_waiting_reqs=len(self._waiting),
             kv_prefetch_jobs=kv_prefetch_jobs,
+            stage_kv_metadata=stage_kv_metadata,
         )
 
         # update after schedule
@@ -168,6 +190,7 @@ class _BaseScheduler(SchedulerInterface):
         return self._request_states.get(request_id)
 
     def pop_request_state(self, request_id: str) -> DiffusionRequestState | None:
+        self._release_stage_kv_allocation(request_id)
         self._pop_extra_request_state(request_id)
         return self._request_states.pop(request_id, None)
 
@@ -190,6 +213,10 @@ class _BaseScheduler(SchedulerInterface):
         self._finish_requests({request_id: status for request_id in request_ids})
 
     def close(self) -> None:
+        if self._stage_kv_runtime is not None:
+            self._stage_kv_runtime.manager.close()
+            self._stage_kv_runtime = None
+        self._stage_kv_cache_mode = StageKVCacheMode.DENSE_LEGACY
         self._request_states.clear()
         self._waiting.clear()
         self._running.clear()
@@ -236,6 +263,7 @@ class _BaseScheduler(SchedulerInterface):
                 state.error = None if errors is None else errors.get(request_id)
             else:
                 state.error = None
+            self._release_stage_kv_allocation(request_id)
 
         self._finished_req_ids |= finished_req_ids
         return finished_req_ids
@@ -263,11 +291,46 @@ class _BaseScheduler(SchedulerInterface):
         """Remove subclass-owned per-request state before popping request state."""
 
     def _make_request_state(self, request_id: str, request: OmniDiffusionRequest) -> DiffusionRequestState:
+        stage_kv_requirement = None
+        if self._stage_kv_runtime is not None:
+            stage_kv_requirement = self._stage_kv_runtime.planner.plan(request)
+            if stage_kv_requirement.request_id != request_id:
+                raise ValueError(
+                    "Stage KV Planner returned a mismatched request id: "
+                    f"expected={request_id!r}, got={stage_kv_requirement.request_id!r}"
+                )
         return DiffusionRequestState(
             request_id=request_id,
             req=request,
             sampling_params_key=self._build_sampling_params_key(request),
+            stage_kv_requirement=stage_kv_requirement,
         )
+
+    @property
+    def stage_kv_cache_mode(self) -> StageKVCacheMode:
+        return self._stage_kv_cache_mode
+
+    def _ensure_stage_kv_allocation(self, state: DiffusionRequestState) -> bool:
+        runtime = self._stage_kv_runtime
+        if runtime is None or state.stage_kv_allocation is not None:
+            return True
+        requirement = state.stage_kv_requirement
+        if requirement is None:
+            raise RuntimeError(f"Request {state.request_id!r} is missing its Stage KV requirement")
+        allocation = runtime.manager.allocate(requirement)
+        if allocation is None:
+            return False
+        state.stage_kv_allocation = allocation
+        return True
+
+    def _release_stage_kv_allocation(self, request_id: str) -> None:
+        runtime = self._stage_kv_runtime
+        if runtime is None:
+            return
+        runtime.manager.free(request_id)
+        state = self._request_states.get(request_id)
+        if state is not None:
+            state.stage_kv_allocation = None
 
     def _can_schedule_waiting(self, state: DiffusionRequestState) -> bool:
         if not self._running:

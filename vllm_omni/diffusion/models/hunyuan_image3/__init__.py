@@ -8,7 +8,14 @@ from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import
     HunyuanImage3Text2ImagePipeline,
 )
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
+    HunyuanImage3KVRequirementPlanner,
     HunyuanImage3Pipeline,
 )
 
-__all__ = ["HunyuanImage3Pipeline", "HunyuanImage3Model", "HunyuanImage3Text2ImagePipeline", "HunyuanFusedMoE"]
+__all__ = [
+    "HunyuanFusedMoE",
+    "HunyuanImage3KVRequirementPlanner",
+    "HunyuanImage3Model",
+    "HunyuanImage3Pipeline",
+    "HunyuanImage3Text2ImagePipeline",
+]

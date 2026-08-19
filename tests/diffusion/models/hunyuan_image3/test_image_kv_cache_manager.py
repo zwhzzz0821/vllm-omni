@@ -35,8 +35,19 @@ SCALING = 1.0 / math.sqrt(HEAD_DIM)
 class MockAttention(nn.Module):
     def __init__(self, num_heads, head_size, causal=False, softmax_scale=None, num_kv_heads=None, **kwargs):
         super().__init__()
+        self.forward_calls = []
+        self.paged_calls = []
 
     def forward(self, query, key, value, attn_metadata=None, **kwargs):
+        from vllm_omni.diffusion.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+
+        if is_forward_context_available() and get_forward_context().paged_kv_adapter is not None:
+            self.paged_calls.append((query, key, value))
+        else:
+            self.forward_calls.append((query, key, value, attn_metadata))
         return query
 
 
@@ -124,6 +135,114 @@ def test_cache_manager_registers_attention_without_adding_dense_state() -> None:
     assert isinstance(mgr, nn.Module)
     assert dict(mgr.named_modules())["attn"] is mgr.attn
     assert mgr.state_dict() == {}
+
+
+def test_scheduler_paged_kv_writes_prefix_then_uses_native_pages() -> None:
+    from vllm_omni.diffusion.forward_context import (
+        override_paged_kv_adapter,
+        set_forward_context,
+    )
+
+    mgr = _make_cache_mgr()
+    bs = 2
+    prefix_lens = torch.tensor([[2], [4]], dtype=torch.long)
+    first_q_len = 12
+    first_k, first_v = _make_known_kv(bs * first_q_len, base=1.0)
+
+    with set_forward_context(), override_paged_kv_adapter(object()):
+        _call_mgr(
+            mgr,
+            bs,
+            q_len=first_q_len,
+            seq_len=first_q_len,
+            key_flat=first_k,
+            value_flat=first_v,
+            first_step=True,
+            gen_timestep_scatter_index=prefix_lens,
+        )
+
+        assert mgr.image_kv_cache_map is None
+        assert mgr.image_kv_cache_lens is None
+        assert len(mgr.attn.paged_calls) == 1
+        assert mgr.attn.paged_calls[0][0].shape == (6, NUM_HEADS, HEAD_DIM)
+        assert len(mgr.attn.forward_calls) == 1
+
+        current_q_len = IMAGE_TOKEN_LEN
+        current_k, current_v = _make_known_kv(bs * current_q_len, base=50.0)
+        _call_mgr(
+            mgr,
+            bs,
+            q_len=current_q_len,
+            seq_len=prefix_lens[-1].item() + current_q_len,
+            key_flat=current_k,
+            value_flat=current_v,
+            position_ids=torch.arange(4, 4 + current_q_len).repeat(bs, 1),
+        )
+
+    assert len(mgr.attn.paged_calls) == 2
+    assert mgr.attn.paged_calls[1][0].shape == (bs, current_q_len, NUM_HEADS, HEAD_DIM)
+    assert len(mgr.attn.forward_calls) == 1
+
+
+def test_hunyuan_model_builds_cfg_paged_rows_from_runtime_geometry() -> None:
+    from vllm_omni.diffusion.forward_context import (
+        override_paged_kv_adapter,
+        set_forward_context,
+    )
+    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+        HunyuanImage3Model,
+    )
+
+    class FakeAdapter:
+        def __init__(self):
+            self.rows = None
+
+        def prepare_batch(self, rows):
+            self.rows = tuple(rows)
+            return self.rows
+
+        @contextmanager
+        def activate(self, batch):
+            assert batch is self.rows
+            with override_paged_kv_adapter(self):
+                yield self
+
+    adapter = FakeAdapter()
+    identities = [("req", 0), ("req", 1)]
+    with patched_mgr_env(sp_size=1), set_forward_context(paged_kv_runtime=adapter):
+        with HunyuanImage3Model._paged_attention_context(
+            mode="gen_image",
+            first_step=True,
+            query_lens=[12, 12],
+            seq_lens=[12, 12],
+            position_ids=torch.arange(12).repeat(2, 1),
+            gen_timestep_scatter_index=torch.tensor([[2], [4]]),
+            ar_kv_reuse_len=0,
+            row_identities=identities,
+        ):
+            pass
+
+        assert [(row.request_id, row.sequence_id, row.query_len, row.seq_len) for row in adapter.rows] == [
+            ("req", 0, 2, 2),
+            ("req", 1, 4, 4),
+        ]
+
+        with HunyuanImage3Model._paged_attention_context(
+            mode="gen_image",
+            first_step=False,
+            query_lens=[3, 3],
+            seq_lens=[8, 9],
+            position_ids=torch.tensor([[4, 5, 6], [5, 6, 7]]),
+            gen_timestep_scatter_index=None,
+            ar_kv_reuse_len=0,
+            row_identities=identities,
+        ):
+            pass
+
+    assert [(row.kv_start_pos, row.query_len, row.seq_len) for row in adapter.rows] == [
+        (4, 3, 7),
+        (5, 3, 8),
+    ]
 
 
 # ============================================================

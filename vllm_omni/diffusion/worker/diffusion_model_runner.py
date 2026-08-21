@@ -397,12 +397,26 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             raise RuntimeError("Model must be loaded before collecting Diffusion KV cache specs")
 
         cache_layers: dict[str, tuple[Attention, KVCacheSpec]] = {}
-        for layer_name, module in self.pipeline.named_modules():
+        cache_layer_paths: dict[str, str] = {}
+        for module_path, module in self.pipeline.named_modules():
             if not isinstance(module, Attention):
                 continue
             spec = module.get_kv_cache_spec(self.vllm_config)
             if spec is not None:
+                layer_name = module.prefix
+                if not isinstance(layer_name, str) or not layer_name:
+                    raise RuntimeError(
+                        "Paged Diffusion Attention must expose a non-empty canonical prefix; "
+                        f"module_path={module_path!r}"
+                    )
+                if layer_name in cache_layers:
+                    raise RuntimeError(
+                        "Duplicate canonical paged Diffusion Attention prefix "
+                        f"{layer_name!r} for module paths "
+                        f"{cache_layer_paths[layer_name]!r} and {module_path!r}"
+                    )
                 cache_layers[layer_name] = (module, spec)
+                cache_layer_paths[layer_name] = module_path
         if not cache_layers:
             raise RuntimeError(
                 "paged_scheduler Diffusion KV found no cache-enabled Attention modules "

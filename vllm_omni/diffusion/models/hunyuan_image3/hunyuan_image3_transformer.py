@@ -82,7 +82,6 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import (
     get_forward_context,
     is_forward_context_available,
-    override_paged_kv_adapter,
     set_forward_context_denoise_step_idx,
 )
 from vllm_omni.diffusion.layers.fused_moe import FusedMoE
@@ -1113,33 +1112,6 @@ class ImageKVCacheManager(nn.Module):
     def _paged_attention_enabled() -> bool:
         return is_forward_context_available() and get_forward_context().paged_kv_adapter is not None
 
-    def _write_paged_prefix(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        prefix_lens: torch.Tensor,
-    ) -> None:
-        """Populate stable prefix pages while first-step output stays dense."""
-
-        packed_query = []
-        packed_key = []
-        packed_value = []
-        for row, prefix_len_tensor in enumerate(prefix_lens):
-            prefix_len = int(prefix_len_tensor.item())
-            if prefix_len <= 0:
-                raise ValueError("Hunyuan paged KV requires a non-empty stable prefix")
-            packed_query.append(query[row, :prefix_len])
-            packed_key.append(key[row, :prefix_len])
-            packed_value.append(value[row, :prefix_len])
-        # Native attention currently has no write-only entry point. Execute the
-        # prefix attention to materialize K/V pages and discard its output.
-        self.attn(
-            torch.cat(packed_query, dim=0),
-            torch.cat(packed_key, dim=0),
-            torch.cat(packed_value, dim=0),
-        )
-
     def forward(
         self,
         query: torch.Tensor,
@@ -1177,13 +1149,10 @@ class ImageKVCacheManager(nn.Module):
             if uncond_cfg_prefill or self._injected_ar_kv is not None:
                 raise NotImplementedError("Hunyuan Scheduler-paged KV does not yet support imported AR KV")
             if first_step:
-                prefix_lens = self._get_current_starts(kwargs.get("gen_timestep_scatter_index"))
                 self.image_kv_cache_map = None
                 self.image_kv_cache_lens = None
-                self._write_paged_prefix(query, key, value, prefix_lens)
-            else:
-                attn_output = self.attn(query, key, value)
-                return attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
+            if kwargs.get("full_attn_spans") is None:
+                raise ValueError("Hunyuan Scheduler-paged KV requires full_attn_spans metadata")
 
         if uncond_cfg_prefill:
             key, value = self._build_neg_ar_kv(key, value, seq_len)
@@ -1215,13 +1184,13 @@ class ImageKVCacheManager(nn.Module):
                     key = key[:, local_prompt_len:, :, :]
                     value = value[:, local_prompt_len:, :, :]
         else:
-            if self.sp_size <= 1:
+            if self.sp_size <= 1 and not paged_attention:
                 key, value = self._reuse_prompt_kv(key, value, seq_len, bs, position_ids=kwargs.get("position_ids"))
-            else:
+            elif self.sp_size > 1:
                 joint_text_query = query[:, :0, :, :]
                 joint_text_key, joint_text_value = self._reuse_prompt_kv(key, value, seq_len, bs, shard_image_size)
 
-        if not keep_kv_compressed:
+        if not keep_kv_compressed and not paged_attention:
             key = repeat_kv(key, repeat_num)
             value = repeat_kv(value, repeat_num)
             if self.sp_size > 1:
@@ -1232,7 +1201,12 @@ class ImageKVCacheManager(nn.Module):
 
         full_attn_spans = kwargs.get("full_attn_spans", None)
 
-        if self.sp_size <= 1:
+        if paged_attention:
+            # The native paged adapter derives all mask semantics from the
+            # explicit full-attention spans. Passing the dense 4D mask would
+            # force an unsupported fallback and duplicate the dense path.
+            attn_metadata = AttentionMetadata(full_attn_spans=full_attn_spans)
+        elif self.sp_size <= 1:
             attn_metadata = AttentionMetadata(
                 attn_mask=attention_mask,
                 full_attn_spans=full_attn_spans,
@@ -1246,9 +1220,7 @@ class ImageKVCacheManager(nn.Module):
                 attn_mask=attention_mask,
                 full_attn_spans=full_attn_spans,
             )
-        attention_context = override_paged_kv_adapter(None) if paged_attention else nullcontext()
-        with attention_context:
-            attn_output = self.attn(query, key, value, attn_metadata)
+        attn_output = self.attn(query, key, value, attn_metadata)
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
         return attn_output
 
@@ -2174,22 +2146,27 @@ class HunyuanImage3Model(nn.Module):
         if first_step:
             if gen_timestep_scatter_index is None:
                 raise ValueError("Hunyuan first-step paged KV requires generated timestep positions")
-            prefix_lens = [int(row[-1].item()) for row in gen_timestep_scatter_index]
-            if len(prefix_lens) != len(row_identities):
+            if len(gen_timestep_scatter_index) != len(row_identities):
                 raise ValueError(
                     "Hunyuan generated timestep rows do not match paged identities: "
-                    f"positions={len(prefix_lens)}, identities={len(row_identities)}"
+                    f"positions={len(gen_timestep_scatter_index)}, identities={len(row_identities)}"
+                )
+            if any(int(query_len) != int(seq_len) for query_len, seq_len in zip(query_lens, seq_lens, strict=True)):
+                raise ValueError(
+                    "Hunyuan first-step paged KV requires the complete sequence as the query when imported AR KV "
+                    "is disabled"
                 )
             rows = [
                 DiffusionPagedAttentionRow(
                     request_id=request_id,
                     sequence_id=sequence_id,
-                    query_len=prefix_len,
-                    seq_len=prefix_len,
+                    query_len=int(query_len),
+                    seq_len=int(seq_len),
                 )
-                for (request_id, sequence_id), prefix_len in zip(
+                for (request_id, sequence_id), query_len, seq_len in zip(
                     row_identities,
-                    prefix_lens,
+                    query_lens,
+                    seq_lens,
                     strict=True,
                 )
             ]

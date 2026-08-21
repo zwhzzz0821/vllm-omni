@@ -37,6 +37,7 @@ class MockAttention(nn.Module):
         super().__init__()
         self.forward_calls = []
         self.paged_calls = []
+        self.paged_metadata = []
 
     def forward(self, query, key, value, attn_metadata=None, **kwargs):
         from vllm_omni.diffusion.forward_context import (
@@ -46,6 +47,7 @@ class MockAttention(nn.Module):
 
         if is_forward_context_available() and get_forward_context().paged_kv_adapter is not None:
             self.paged_calls.append((query, key, value))
+            self.paged_metadata.append(attn_metadata)
         else:
             self.forward_calls.append((query, key, value, attn_metadata))
         return query
@@ -110,6 +112,7 @@ def _call_mgr(
     shard_image_size=None,
     gen_timestep_scatter_index=None,
     position_ids=None,
+    full_attn_spans=None,
 ):
     query = torch.randn(bs * q_len, NUM_HEADS, HEAD_DIM)
     attn_mask = torch.zeros(bs, 1, seq_len, seq_len)
@@ -126,6 +129,7 @@ def _call_mgr(
         shard_image_size=shard_image_size,
         gen_timestep_scatter_index=gen_timestep_scatter_index,
         position_ids=position_ids,
+        full_attn_spans=full_attn_spans,
     )
 
 
@@ -137,7 +141,7 @@ def test_cache_manager_registers_attention_without_adding_dense_state() -> None:
     assert mgr.state_dict() == {}
 
 
-def test_scheduler_paged_kv_writes_prefix_then_uses_native_pages() -> None:
+def test_scheduler_paged_kv_runs_piecewise_for_first_and_later_steps() -> None:
     from vllm_omni.diffusion.forward_context import (
         override_paged_kv_adapter,
         set_forward_context,
@@ -148,6 +152,7 @@ def test_scheduler_paged_kv_writes_prefix_then_uses_native_pages() -> None:
     prefix_lens = torch.tensor([[2], [4]], dtype=torch.long)
     first_q_len = 12
     first_k, first_v = _make_known_kv(bs * first_q_len, base=1.0)
+    full_attn_spans = [[(2, 12)], [(2, 12)]]
 
     with set_forward_context(), override_paged_kv_adapter(object()):
         _call_mgr(
@@ -159,13 +164,17 @@ def test_scheduler_paged_kv_writes_prefix_then_uses_native_pages() -> None:
             value_flat=first_v,
             first_step=True,
             gen_timestep_scatter_index=prefix_lens,
+            full_attn_spans=full_attn_spans,
         )
 
         assert mgr.image_kv_cache_map is None
         assert mgr.image_kv_cache_lens is None
         assert len(mgr.attn.paged_calls) == 1
-        assert mgr.attn.paged_calls[0][0].shape == (6, NUM_HEADS, HEAD_DIM)
-        assert len(mgr.attn.forward_calls) == 1
+        assert mgr.attn.paged_calls[0][0].shape == (bs, first_q_len, NUM_HEADS, HEAD_DIM)
+        assert mgr.attn.paged_calls[0][1].shape == (bs, first_q_len, NUM_KV_HEADS, HEAD_DIM)
+        assert mgr.attn.paged_calls[0][2].shape == (bs, first_q_len, NUM_KV_HEADS, HEAD_DIM)
+        assert mgr.attn.paged_metadata[0].full_attn_spans == full_attn_spans
+        assert len(mgr.attn.forward_calls) == 0
 
         current_q_len = IMAGE_TOKEN_LEN
         current_k, current_v = _make_known_kv(bs * current_q_len, base=50.0)
@@ -177,11 +186,15 @@ def test_scheduler_paged_kv_writes_prefix_then_uses_native_pages() -> None:
             key_flat=current_k,
             value_flat=current_v,
             position_ids=torch.arange(4, 4 + current_q_len).repeat(bs, 1),
+            full_attn_spans=full_attn_spans,
         )
 
     assert len(mgr.attn.paged_calls) == 2
     assert mgr.attn.paged_calls[1][0].shape == (bs, current_q_len, NUM_HEADS, HEAD_DIM)
-    assert len(mgr.attn.forward_calls) == 1
+    assert mgr.attn.paged_calls[1][1].shape == (bs, current_q_len, NUM_KV_HEADS, HEAD_DIM)
+    assert mgr.attn.paged_calls[1][2].shape == (bs, current_q_len, NUM_KV_HEADS, HEAD_DIM)
+    assert mgr.attn.paged_metadata[1].full_attn_spans == full_attn_spans
+    assert len(mgr.attn.forward_calls) == 0
 
 
 def test_hunyuan_model_builds_cfg_paged_rows_from_runtime_geometry() -> None:
@@ -222,9 +235,11 @@ def test_hunyuan_model_builds_cfg_paged_rows_from_runtime_geometry() -> None:
         ):
             pass
 
-        assert [(row.request_id, row.sequence_id, row.query_len, row.seq_len) for row in adapter.rows] == [
-            ("req", 0, 2, 2),
-            ("req", 1, 4, 4),
+        assert [
+            (row.request_id, row.sequence_id, row.query_len, row.seq_len, row.kv_start_pos) for row in adapter.rows
+        ] == [
+            ("req", 0, 12, 12, 0),
+            ("req", 1, 12, 12, 0),
         ]
 
         with HunyuanImage3Model._paged_attention_context(
@@ -243,6 +258,27 @@ def test_hunyuan_model_builds_cfg_paged_rows_from_runtime_geometry() -> None:
         (4, 3, 7),
         (5, 3, 8),
     ]
+
+
+def test_hunyuan_model_rejects_partial_first_step_paged_rows() -> None:
+    from vllm_omni.diffusion.forward_context import set_forward_context
+    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+        HunyuanImage3Model,
+    )
+
+    runtime = object()
+    with patched_mgr_env(sp_size=1), set_forward_context(paged_kv_runtime=runtime):
+        with pytest.raises(ValueError, match="complete sequence as the query"):
+            HunyuanImage3Model._paged_attention_context(
+                mode="gen_image",
+                first_step=True,
+                query_lens=[8],
+                seq_lens=[12],
+                position_ids=torch.arange(8).reshape(1, -1),
+                gen_timestep_scatter_index=torch.tensor([[2]]),
+                ar_kv_reuse_len=0,
+                row_identities=[("req", 0)],
+            )
 
 
 # ============================================================

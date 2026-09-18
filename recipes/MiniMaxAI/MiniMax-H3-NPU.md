@@ -332,6 +332,48 @@ The optimizations stacked by the recommended configurations above:
    parallelism, plus distributed layerwise offload.
 6. Post-training: few-step distillation via the FlashGen online LoRA.
 
+## INT8 regression tests (Atlas 800I A2 / A3)
+
+The NPU ready pipeline runs a checkpoint-free text-MLP regression on one
+device. It loads synthetic BF16/FP16 weights through the real online INT8
+loader, executes the NPU MLP override, and compares against a float reference:
+
+```bash
+pytest -s -v tests/diffusion/models/minimax_h3/test_minimax_h3_int8_npu.py \
+  -m 'core_model and npu and A2' --run-level core_model
+```
+
+The nightly pipeline runs both online and offline full-model T2VA on four devices, with global
+`--quantization int8`, USP/text-encoder TP/VAE tile parallelism of 4,
+rank-local layer offload, and TORCH_SDPA. Global INT8 includes the text
+encoder; the transformer-only INT8 configuration above does not exercise
+the regression from issues #6595 and #6852.
+
+Use the environment prerequisites above and a complete MiniMax-H3 checkpoint.
+For a local checkpoint, clear `MODEL_PREFIX` (the test fixture otherwise
+prepends it to the model path):
+
+```bash
+export MODEL_PREFIX=""
+export VLLM_TEST_MINIMAX_H3_MODEL=/path/to/MiniMax-H3
+pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3_int8_npu.py \
+  -m 'full_model and npu and A2' --run-level full_model
+
+pytest -s -v tests/e2e/offline_inference/test_minimax_h3_int8_npu.py \
+  -m 'full_model and npu and A2' --run-level full_model
+```
+
+Replace `A2` with `A3` in these commands for Atlas A3. Keep
+`--run-level full_model` for E2E: `core_model` substitutes a tiny checkpoint.
+Both E2E cases generate a four-second, four-step 1344x768 clip. Online checks
+HTTP/MP4 video metadata and decodable audio. Offline uses the shared `omni_runner`
+fixture and calls `Omni.generate()` directly: it checks that Python
+`quantization="int8"` reaches both transformer and text-encoder configurations,
+then validates raw video frames and finite stereo audio at 32 kHz. The fixture
+closes the engine after the test. These are functional smoke tests, not quality
+or performance benchmarks. They run on scheduled nightly builds or eligible PRs
+with the `nightly-test` label; the layer regression runs in ready CI.
+
 ## Benchmarks (Atlas 800I A2 / A3)
 
 Measured with `--enable-diffusion-pipeline-profiler` on vLLM-Omni 0.28.0:

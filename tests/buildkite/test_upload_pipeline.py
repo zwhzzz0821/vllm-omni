@@ -552,6 +552,33 @@ def test_pipeline_source_file_dependency_keys_are_registered() -> None:
     assert not missing, f"unregistered source_file_dependencies keys: {sorted(missing)}"
 
 
+@pytest.mark.parametrize(
+    "changed_file",
+    [
+        "tests/e2e/offline_inference/test_minimax_h3_int8_npu.py",
+        "tests/e2e/minimax_h3_config.py",
+        "vllm_omni/quantization/int8_config.py",
+        "vllm_omni/diffusion/models/minimax_h3/encoder.py",
+        "vllm_omni/platforms/npu/models/minimax_h3.py",
+        "vllm_omni/entrypoints/omni.py",
+    ],
+)
+def test_npu_int8_nightly_selects_both_inference_entries(changed_file: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    path = Path(".buildkite/npu/test-npu-nightly.yml")
+    rendered = _render_test_pipeline(yaml.safe_load(path.read_text()), changed_files=[changed_file], pipeline_path=path)
+    by_key = {step["key"]: step for step in _iter_steps(rendered) if "key" in step}
+    for sku, queue in (("a2", "ascend-a2b3"), ("a3", "ascend-a3")):
+        step = by_key[f"nightly-minimax-h3-int8-npu-{sku}"]
+        commands = " ".join(step["commands"])
+        assert "tests/e2e/offline_inference/test_minimax_h3_int8_npu.py" in commands
+        assert "tests/e2e/online_serving/minimax_h3/test_minimax_h3_int8_npu.py" in commands
+        assert f"full_model and npu and {sku.upper()}" in commands
+        assert "--run-level full_model" in commands
+        assert step["agents"]["queue"] == queue
+        assert step["agents"]["resource_class"] == "npu-4"
+
+
 def test_source_file_dependencies_key_expands_from_registry() -> None:
     doc = {
         "steps": [

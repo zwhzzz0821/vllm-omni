@@ -17,6 +17,12 @@ from typing import Any
 import av
 import requests
 
+from tests.e2e.minimax_h3_config import DURATION, PROMPT
+from tests.e2e.minimax_h3_config import FPS as FPS
+from tests.e2e.minimax_h3_config import HEIGHT as HEIGHT
+from tests.e2e.minimax_h3_config import MODEL as MODEL
+from tests.e2e.minimax_h3_config import NUM_INFERENCE_STEPS as NUM_INFERENCE_STEPS
+from tests.e2e.minimax_h3_config import WIDTH as WIDTH
 from tests.helpers.assertions import assert_video_valid
 from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import OmniServerParams, OpenAIClientHandler
@@ -26,11 +32,6 @@ from tests.helpers.runtime import OmniServerParams, OpenAIClientHandler
 # state from a preceding server lifecycle.
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-MODEL = os.environ.get("VLLM_TEST_MINIMAX_H3_MODEL", "MiniMaxAI/MiniMax-H3")
-WIDTH = 1344
-HEIGHT = 768
-FPS = 24
-NUM_INFERENCE_STEPS = 4
 # Keep a failed collective/preprocessing regression bounded well below the
 # per-file Buildkite timeout.  Healthy H100 runs complete in under two minutes
 # after startup; ten minutes leaves ample room for a cold compile.
@@ -141,6 +142,8 @@ def post_sync(
     client: OpenAIClientHandler,
     form_data: dict[str, str],
     files: Any = None,
+    *,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
 ) -> bytes:
     """Submit one synchronous video request and return its MP4 body."""
     response = requests.post(
@@ -148,7 +151,7 @@ def post_sync(
         data=form_data,
         files=files,
         headers={"Accept": "video/mp4"},
-        timeout=REQUEST_TIMEOUT_SECONDS,
+        timeout=timeout,
     )
     response.raise_for_status()
     assert response.headers.get("content-type", "").startswith("video/mp4")
@@ -159,10 +162,7 @@ def post_sync(
 def _h3_form(task: str, seed: int) -> dict[str, str]:
     return {
         "model": MODEL,
-        "prompt": (
-            "A cinematic live-action scene with a clear subject moving naturally; "
-            "the atmosphere includes synchronized environmental sound."
-        ),
+        "prompt": PROMPT,
         "width": str(WIDTH),
         "height": str(HEIGHT),
         "fps": str(FPS),
@@ -172,13 +172,17 @@ def _h3_form(task: str, seed: int) -> dict[str, str]:
         "extra_params": json.dumps(
             {
                 "task": task,
-                "duration": 4.0,
+                "duration": DURATION,
                 "aspect_ratio": "16:9",
                 "audio_flow_shift": 3.0,
             },
             separators=(",", ":"),
         ),
     }
+
+
+def run_t2va(client: OpenAIClientHandler, seed: int, *, timeout: int = REQUEST_TIMEOUT_SECONDS) -> bytes:
+    return post_sync(client, _h3_form("t2va", seed), timeout=timeout)
 
 
 def run_fl2va(client: OpenAIClientHandler, seed: int) -> bytes:

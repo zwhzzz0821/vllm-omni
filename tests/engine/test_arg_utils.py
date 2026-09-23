@@ -17,14 +17,12 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from omegaconf import OmegaConf
 from pydantic import ValidationError
 from transformers import PretrainedConfig, Qwen3OmniMoeConfig
 from vllm.engine.arg_utils import EngineArgs
 
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
-from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -534,12 +532,3 @@ def test_non_override_ar_stage_inputs_embeds_size_matches_hidden_size():
 
 
 # For https://github.com/vllm-project/vllm-omni/issues/3293
-def test_tensor_parallel_size_none_is_handled():
-    """Ensure the tensor parallel size of None isn't forwarded."""
-    engine_args = OmegaConf.create({"stage_id": 0, "engine_args": {"tensor_parallel_size": None}})
-    args = build_engine_args_dict(
-        engine_args,
-        model="snu-aidas/Dynin-Omni",
-    )
-    assert isinstance(args, dict)
-    assert "tensor_parallel_size" not in args

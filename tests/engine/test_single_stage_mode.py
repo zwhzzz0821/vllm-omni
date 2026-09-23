@@ -648,7 +648,7 @@ class TestSingleStageInitialization:
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(
             runtime_mod,
-            "extract_legacy_stage_metadata",
+            "extract_stage_metadata",
             lambda cfg: SimpleNamespace(
                 stage_id=cfg.stage_id,
                 stage_type=getattr(cfg, "stage_type", "llm"),
@@ -658,7 +658,7 @@ class TestSingleStageInitialization:
         )
         monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
         monkeypatch.setattr(runtime_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
-        monkeypatch.setattr(runtime_mod, "build_engine_args_dict", lambda *_, **__: {})
+        monkeypatch.setattr(runtime_mod, "project_engine_args", lambda *_, **__: {})
         monkeypatch.setattr(runtime_mod, "build_vllm_config", lambda *_, **__: (SimpleNamespace(), object))
         try:
             stage_plans = runtime._build_logical_stage_init_plans(None, [1, 1], {})
@@ -675,7 +675,7 @@ class TestSingleStageInitialization:
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(
             runtime_mod,
-            "extract_legacy_stage_metadata",
+            "extract_stage_metadata",
             lambda cfg: SimpleNamespace(
                 stage_id=cfg.stage_id,
                 stage_type=getattr(cfg, "stage_type", "llm"),
@@ -748,7 +748,7 @@ class TestSingleStageInitialization:
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(
             runtime_mod,
-            "extract_legacy_stage_metadata",
+            "extract_stage_metadata",
             lambda cfg: SimpleNamespace(
                 stage_id=cfg.stage_id,
                 stage_type="llm",
@@ -758,7 +758,7 @@ class TestSingleStageInitialization:
         )
         monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
         monkeypatch.setattr(runtime_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
-        monkeypatch.setattr(runtime_mod, "build_engine_args_dict", lambda *_, **__: {})
+        monkeypatch.setattr(runtime_mod, "project_engine_args", lambda *_, **__: {})
         monkeypatch.setattr(
             runtime_mod,
             "build_vllm_config",
@@ -807,7 +807,7 @@ class TestSingleStageInitialization:
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(
             runtime_mod,
-            "extract_legacy_stage_metadata",
+            "extract_stage_metadata",
             lambda cfg: SimpleNamespace(
                 stage_id=cfg.stage_id,
                 stage_type="diffusion",
@@ -1090,7 +1090,7 @@ class TestSingleStageReplicaInitialization:
         os.environ[device_env_var] = "0"
         runtime._init_visible_devices_baseline = "0"
 
-        mocker.patch.object(runtime_mod, "build_engine_args_dict", return_value={})
+        mocker.patch.object(runtime_mod, "project_engine_args", return_value={})
         mocker.patch.object(runtime_mod, "acquire_device_locks", return_value=[])
         mocker.patch.object(runtime_mod, "release_device_locks")
         mock_launch = mocker.patch.object(runtime_mod, "launch_stage_replica", side_effect=_fake_launch)
@@ -1192,7 +1192,7 @@ class TestSingleStageReplicaInitialization:
 
         mocker.patch.object(runtime_mod, "inject_kv_stage_info")
         od_config = SimpleNamespace(max_num_seqs=4, parallel_config=SimpleNamespace(world_size=1))
-        mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_config", return_value=od_config)
+        mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_stage_config", return_value=od_config)
         mock_register = mocker.patch(
             "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
             return_value=StageRegistrationResponse(
@@ -1273,7 +1273,9 @@ class TestSingleStageReplicaInitialization:
         runtime._omni_master_server = mocker.Mock(spec=OmniMasterServer)
         runtime._coordinator_runtime = None
         plan = _make_diffusion_plan(0, stage_id=0, launch_mode="local").replicas[0]
-        plan.stage_cfg.engine_args = {"custom_pipeline_args": {"pipeline_class": "test.CustomPipeline"}}
+        plan.stage_cfg.diffusion_config = SimpleNamespace(
+            custom_pipeline_args={"pipeline_class": "test.CustomPipeline"}
+        )
         sentinel_client = SimpleNamespace()
         mock_launch = mocker.patch.object(
             runtime_mod,
@@ -1325,7 +1327,7 @@ class TestSingleStageReplicaInitialization:
 
         mocker.patch.object(runtime_mod, "inject_kv_stage_info")
         od_config = SimpleNamespace(max_num_seqs=None, parallel_config=SimpleNamespace(world_size=1))
-        mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_config", return_value=od_config)
+        mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_stage_config", return_value=od_config)
         mocker.patch(
             "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
             return_value=StageRegistrationResponse(
